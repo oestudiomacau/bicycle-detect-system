@@ -14,6 +14,8 @@
 - 海康 HCNetSDK、Anomalib 模型适配接口
 - 三段开放许可示例视频和快速加载菜单
 - 本地视频播放、真实自行车检测和简单质心跟踪
+- 在停车画面中拖拽标定规定停车区域，并自动保存配置
+- Anomalib 2.6.2 独立训练页面，支持 PatchCore、PaDiM、CUDA/CPU 和模型导出
 
 模拟源中的检测框由模拟引擎生成。本地视频中的自行车检测框来自 MobileNet SSD；速度结果仍依赖现场距离标定和稳定跟踪，停车模块当前只对真实检测框执行越界规则，倒地与异常堆放需要接入 Anomalib。
 
@@ -30,6 +32,7 @@ py -m venv .venv
 ```
 
 数据会写入 `runtime/events.jsonl`，截图保存在 `runtime/snapshots/`。
+人工标定的停车区域保存在 `runtime/settings.json`。
 
 工具栏中的“加载示例视频”可以直接选择：
 
@@ -56,5 +59,31 @@ py -m venv .venv
 4. 切换观察位期间暂停分析，并重置目标跟踪状态。
 
 Anomalib 接入位于同文件的 `ParkingAnomalyAdapter`。真实检测阶段可将模型输出的异常分数、标签和掩膜转换为统一事件。
+
+## 停车区域人工标定
+
+1. 切换到“违规停放监测”。
+2. 点击右侧“标定区域”，视频会自动暂停。
+3. 在画面中按住鼠标左键拖出矩形，点击“确认区域”。
+
+标定结果会同时作用于模拟源和本地视频检测。“恢复默认”可还原初始区域。
+
+## Anomalib 训练
+
+侧边栏进入“异常模型训练”，首次使用时点击“安装 / 更新 Anomalib”。训练依赖安装在独立的 `.venv-anomalib` 中，不会改变主 GUI 环境。
+
+- 默认模型：PatchCore + ResNet18
+- 轻量备选：PaDiM + ResNet18
+- 推荐设备：RTX 2060 使用 CUDA 12.6
+- 已在 RTX 2060 6GB 上验证；默认 `256 px / batch 4`，显存不足时将 batch 调到 1 或 2
+- 输入数据：正常停车图片必需，异常测试图片可选
+- 输出位置：`artifacts/anomalib/<训练时间>/`
+- 导出结果：Torch `.pt`，以及可选的 OpenVINO 模型
+
+数据目录示例和采集建议见 `datasets/README.md`。训练环境也可在命令行安装：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\setup_anomalib_env.py --env .venv-anomalib --backend cu126
+```
 
 速度检测的核心计算和停车规则位于 `campus_monitor/domain.py`，模拟数据流位于 `campus_monitor/simulation.py`，便于后续用真实检测跟踪结果替换。

@@ -73,6 +73,13 @@ class SimulationEngine(QObject):
         self.speed_service.distance_m = distance_m
         self.speed_service.threshold_kmh = threshold_kmh
 
+    def set_parking_zone(self, zone: tuple[float, float, float, float]) -> None:
+        self.parking_service.set_zone(zone)
+        self.parked_vehicles = self._build_parking_scene()
+        self._parking_events_emitted = False
+        self.frame_changed.emit()
+        self._emit_metrics()
+
     def reset_scene(self) -> None:
         self.elapsed_s = 0.0
         self.road_tracks = [
@@ -183,4 +190,3 @@ class SimulationEngine(QObject):
                 "parking_violations": parking_violations,
             }
         )
-

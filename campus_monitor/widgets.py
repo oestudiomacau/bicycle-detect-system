@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from PySide6.QtCore import QPointF, QRectF, Qt
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
@@ -37,6 +37,8 @@ class MetricCard(QFrame):
 
 
 class VideoCanvas(QWidget):
+    zone_changed = Signal(object)
+
     def __init__(self, engine: SimulationEngine, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.engine = engine
@@ -44,6 +46,10 @@ class VideoCanvas(QWidget):
         self.real_detections: list[TrackedDetection] = []
         self.source_name = "模拟视频源"
         self.real_video_running = False
+        self.calibration_active = False
+        self._calibration_start: QPointF | None = None
+        self._calibration_end: QPointF | None = None
+        self._draft_zone: tuple[float, float, float, float] | None = None
         self.setObjectName("videoCanvas")
         self.setMinimumSize(650, 370)
         self.engine.frame_changed.connect(self.update)
@@ -59,7 +65,75 @@ class VideoCanvas(QWidget):
             self._paint_road(painter)
         else:
             self._paint_parking(painter)
+        self._paint_calibration(painter)
         self._paint_hud(painter)
+
+    @property
+    def draft_zone(self) -> tuple[float, float, float, float] | None:
+        return self._draft_zone
+
+    def begin_zone_calibration(self) -> None:
+        self.calibration_active = True
+        self._calibration_start = None
+        self._calibration_end = None
+        self._draft_zone = None
+        self.setCursor(Qt.CursorShape.CrossCursor)
+        self.update()
+
+    def confirm_zone_calibration(self) -> bool:
+        if not self.calibration_active or self._draft_zone is None:
+            return False
+        zone = self._draft_zone
+        self._finish_calibration()
+        self.zone_changed.emit(zone)
+        return True
+
+    def cancel_zone_calibration(self) -> None:
+        self._finish_calibration()
+
+    def _finish_calibration(self) -> None:
+        self.calibration_active = False
+        self._calibration_start = None
+        self._calibration_end = None
+        self._draft_zone = None
+        self.unsetCursor()
+        self.update()
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if (
+            not self.calibration_active
+            or event.button() != Qt.MouseButton.LeftButton
+            or not self._content_rect().contains(event.position())
+        ):
+            super().mousePressEvent(event)
+            return
+        self._calibration_start = self._clamp_to_content(event.position())
+        self._calibration_end = self._calibration_start
+        self._draft_zone = None
+        event.accept()
+        self.update()
+
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802
+        if not self.calibration_active or self._calibration_start is None:
+            super().mouseMoveEvent(event)
+            return
+        self._calibration_end = self._clamp_to_content(event.position())
+        self._draft_zone = self._zone_from_points(self._calibration_start, self._calibration_end)
+        event.accept()
+        self.update()
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
+        if (
+            not self.calibration_active
+            or self._calibration_start is None
+            or event.button() != Qt.MouseButton.LeftButton
+        ):
+            super().mouseReleaseEvent(event)
+            return
+        self._calibration_end = self._clamp_to_content(event.position())
+        self._draft_zone = self._zone_from_points(self._calibration_start, self._calibration_end)
+        event.accept()
+        self.update()
 
     def set_video_frame(
         self,
@@ -98,6 +172,69 @@ class VideoCanvas(QWidget):
         )
         painter.drawImage(target, self.video_frame)
         return target
+
+    def _content_rect(self) -> QRectF:
+        if self.video_frame is None:
+            return QRectF(self.rect())
+        image_size = self.video_frame.size()
+        scale = min(self.width() / image_size.width(), self.height() / image_size.height())
+        draw_width = image_size.width() * scale
+        draw_height = image_size.height() * scale
+        return QRectF(
+            (self.width() - draw_width) / 2,
+            (self.height() - draw_height) / 2,
+            draw_width,
+            draw_height,
+        )
+
+    def _clamp_to_content(self, point: QPointF) -> QPointF:
+        content = self._content_rect()
+        return QPointF(
+            min(max(point.x(), content.left()), content.right()),
+            min(max(point.y(), content.top()), content.bottom()),
+        )
+
+    def _zone_from_points(
+        self,
+        start: QPointF,
+        end: QPointF,
+    ) -> tuple[float, float, float, float] | None:
+        content = self._content_rect()
+        if content.width() <= 0 or content.height() <= 0:
+            return None
+        left = (min(start.x(), end.x()) - content.left()) / content.width()
+        top = (min(start.y(), end.y()) - content.top()) / content.height()
+        right = (max(start.x(), end.x()) - content.left()) / content.width()
+        bottom = (max(start.y(), end.y()) - content.top()) / content.height()
+        zone = (left, top, right, bottom)
+        if right - left < 0.02 or bottom - top < 0.02:
+            return None
+        return zone
+
+    def _paint_calibration(self, painter: QPainter) -> None:
+        if not self.calibration_active:
+            return
+        content = self._content_rect()
+        painter.save()
+        painter.setPen(QPen(QColor("#f0b542"), 2, Qt.PenStyle.DashLine))
+        painter.setBrush(QColor(240, 181, 66, 30))
+        if self._draft_zone is not None:
+            left, top, right, bottom = self._draft_zone
+            draft = QRectF(
+                content.left() + left * content.width(),
+                content.top() + top * content.height(),
+                (right - left) * content.width(),
+                (bottom - top) * content.height(),
+            )
+            painter.drawRect(draft)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(8, 13, 16, 220))
+        hint = QRectF(content.left() + 14, content.bottom() - 48, 285, 32)
+        painter.drawRoundedRect(hint, 4, 4)
+        painter.setPen(QColor("#f7d58b"))
+        painter.setFont(QFont("Noto Sans SC", 9))
+        painter.drawText(hint.adjusted(10, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter, "按住鼠标左键拖拽停车区域")
+        painter.restore()
 
     def _paint_real_overlays(self, painter: QPainter, video_rect: QRectF) -> None:
         if self.engine.mode == "road":

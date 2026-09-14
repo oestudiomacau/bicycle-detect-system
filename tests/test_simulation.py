@@ -30,7 +30,12 @@ class SimulationEngineTest(unittest.TestCase):
         types = {event.event_type for event in self.events}
         self.assertEqual(types, {"越界停放", "倒地异常", "异常堆放"})
 
+    def test_manual_zone_rebuilds_parking_classification(self) -> None:
+        self.engine.set_mode("parking")
+        self.engine.set_parking_zone((0.0, 0.0, 1.0, 1.0))
+        violations = [item.violation for item in self.engine.parked_vehicles if item.violation]
+        self.assertEqual(set(violations), {"倒地异常", "异常堆放"})
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -211,6 +211,12 @@ class VideoAnalysisController(QObject):
         self.speed_service.distance_m = distance_m
         self.speed_service.threshold_kmh = threshold_kmh
 
+    def set_parking_zone(self, zone: tuple[float, float, float, float]) -> None:
+        self.parking_service.set_zone(zone)
+        self._parking_event_ids.clear()
+        if self.mode == "parking":
+            self._evaluate_parking()
+
     def _tick(self) -> None:
         if not self.running or self.capture is None:
             return

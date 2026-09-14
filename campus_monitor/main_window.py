@@ -19,15 +19,18 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPushButton,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from .domain import EventStore, MonitorEvent
+from .domain import DEFAULT_PARKING_ZONE, EventStore, MonitorEvent
 from .integrations import HikvisionSdkAdapter, ParkingAnomalyAdapter
+from .settings import SettingsStore
 from .simulation import SimulationEngine
+from .training_page import AnomalibTrainingPage
 from .video_analysis import VideoAnalysisController
 from .widgets import MetricCard, VideoCanvas
 
@@ -54,10 +57,15 @@ class MainWindow(QMainWindow):
         )
         self.active_source = "simulation"
         self.event_store = EventStore(RUNTIME_DIR / "events.jsonl")
+        self.settings_store = SettingsStore(RUNTIME_DIR / "settings.json")
         self.hikvision = HikvisionSdkAdapter()
         self.anomalib = ParkingAnomalyAdapter()
         self.events: list[MonitorEvent] = self.event_store.load()
         self.warning_count = sum(1 for item in self.events if item.severity == "warning")
+        self._calibration_was_running = False
+        parking_zone = self.settings_store.load_parking_zone()
+        self.engine.set_parking_zone(parking_zone)
+        self.video_controller.set_parking_zone(parking_zone)
 
         self._apply_theme()
         self._build_ui()
@@ -67,6 +75,10 @@ class MainWindow(QMainWindow):
         self.video_controller.event_raised.connect(self._handle_event)
         self.video_controller.metrics_changed.connect(self._update_metrics)
         self.video_controller.status_changed.connect(self._update_source_status)
+        self.canvas.zone_changed.connect(self._apply_parking_zone)
+        self.training_page.status_changed.connect(
+            lambda message: self.statusBar().showMessage(message, 7000)
+        )
         self._load_event_table()
         self._refresh_mode_panel()
 
@@ -78,7 +90,12 @@ class MainWindow(QMainWindow):
         shell_layout.setContentsMargins(0, 0, 0, 0)
         shell_layout.setSpacing(0)
         shell_layout.addWidget(self._build_sidebar())
-        shell_layout.addWidget(self._build_workspace(), 1)
+        self.pages = QStackedWidget()
+        self.monitor_workspace = self._build_workspace()
+        self.training_page = AnomalibTrainingPage(ROOT)
+        self.pages.addWidget(self.monitor_workspace)
+        self.pages.addWidget(self.training_page)
+        shell_layout.addWidget(self.pages, 1)
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -103,12 +120,20 @@ class MainWindow(QMainWindow):
         self.road_nav = self._nav_button("行驶速度检测")
         self.parking_nav = self._nav_button("违规停放监测")
         self.events_nav = self._nav_button("事件与截图")
+        self.training_nav = self._nav_button("异常模型训练")
         self.settings_nav = self._nav_button("系统接口设置")
         self.road_nav.clicked.connect(lambda: self.select_mode("road"))
         self.parking_nav.clicked.connect(lambda: self.select_mode("parking"))
         self.events_nav.clicked.connect(self._focus_events)
+        self.training_nav.clicked.connect(self.show_training)
         self.settings_nav.clicked.connect(self._show_sdk_info)
-        for button in (self.road_nav, self.parking_nav, self.events_nav, self.settings_nav):
+        for button in (
+            self.road_nav,
+            self.parking_nav,
+            self.events_nav,
+            self.training_nav,
+            self.settings_nav,
+        ):
             layout.addWidget(button)
         self.road_nav.setChecked(True)
 
@@ -297,8 +322,25 @@ class MainWindow(QMainWindow):
         self.zone_label = QLabel("停车区域")
         self.zone_value = QLabel("ROI 01 · 已配置")
         self.zone_value.setObjectName("readOnlyValue")
+        zone_actions = QHBoxLayout()
+        zone_actions.setSpacing(6)
+        self.calibrate_zone_button = QPushButton("标定区域")
+        self.calibrate_zone_button.clicked.connect(self._start_zone_calibration)
+        self.reset_zone_button = QPushButton("恢复默认")
+        self.reset_zone_button.clicked.connect(self._reset_default_zone)
+        self.confirm_zone_button = QPushButton("确认区域")
+        self.confirm_zone_button.setObjectName("primaryButton")
+        self.confirm_zone_button.clicked.connect(self._confirm_zone_calibration)
+        self.cancel_zone_button = QPushButton("取消")
+        self.cancel_zone_button.clicked.connect(self._cancel_zone_calibration)
+        zone_actions.addWidget(self.calibrate_zone_button)
+        zone_actions.addWidget(self.reset_zone_button)
+        zone_actions.addWidget(self.confirm_zone_button)
+        zone_actions.addWidget(self.cancel_zone_button)
+        self.confirm_zone_button.hide()
+        self.cancel_zone_button.hide()
         self.model_label = QLabel("状态异常模型")
-        self.model_value = QLabel("Anomalib · 待接入")
+        self.model_value = QLabel("Anomalib 2.6.2 · 可训练")
         self.model_value.setObjectName("readOnlyValueWarning")
 
         for label, widget in (
@@ -310,6 +352,8 @@ class MainWindow(QMainWindow):
             label.setObjectName("fieldLabel")
             layout.addWidget(label)
             layout.addWidget(widget)
+            if widget is self.zone_value:
+                layout.addLayout(zone_actions)
 
         layout.addStretch()
         divider = QFrame()
@@ -345,6 +389,10 @@ class MainWindow(QMainWindow):
         return table
 
     def select_mode(self, mode: str) -> None:
+        if hasattr(self, "canvas") and self.canvas.calibration_active and mode != "parking":
+            self._cancel_zone_calibration()
+        if hasattr(self, "pages"):
+            self.pages.setCurrentWidget(self.monitor_workspace)
         self.engine.set_mode(mode)
         self.video_controller.set_mode(mode)
         road = mode == "road"
@@ -375,6 +423,16 @@ class MainWindow(QMainWindow):
         self.zone_value.setVisible(not road)
         self.model_label.setVisible(not road)
         self.model_value.setVisible(not road)
+        for button in (
+            self.calibrate_zone_button,
+            self.reset_zone_button,
+            self.confirm_zone_button,
+            self.cancel_zone_button,
+        ):
+            button.setVisible(not road and (button.isVisible() or not self.canvas.calibration_active))
+        if not road:
+            self._update_zone_controls()
+            self.zone_value.setText(self._zone_summary(self.engine.parking_service.zone))
         self.pipeline_label.setText(
             "处理链路\n模拟取流 → 目标跟踪 → 双线计时 → 速度计算 → 阈值告警"
             if road
@@ -401,6 +459,80 @@ class MainWindow(QMainWindow):
         self.engine.set_speed_config(self.distance_spin.value(), self.threshold_spin.value())
         self.video_controller.set_speed_config(self.distance_spin.value(), self.threshold_spin.value())
         self.canvas.update()
+
+    def _start_zone_calibration(self) -> None:
+        self.select_mode("parking")
+        if self.canvas.calibration_active:
+            return
+        self._calibration_was_running = (
+            self.video_controller.running if self.active_source == "video" else self.engine.running
+        )
+        if self.active_source == "video":
+            self.video_controller.set_running(False)
+            self.canvas.set_video_running(False)
+        else:
+            self.engine.set_running(False)
+        self.canvas.begin_zone_calibration()
+        self.run_button.setEnabled(False)
+        self.reset_button.setEnabled(False)
+        self.zone_value.setText("请在画面中拖拽一个矩形区域")
+        self._update_zone_controls()
+
+    def _confirm_zone_calibration(self) -> None:
+        if not self.canvas.confirm_zone_calibration():
+            QMessageBox.information(self, "停车区域标定", "请先在画面中按住鼠标拖拽停车区域。")
+            return
+        self._finish_zone_calibration()
+
+    def _cancel_zone_calibration(self) -> None:
+        if not self.canvas.calibration_active:
+            return
+        self.canvas.cancel_zone_calibration()
+        self.zone_value.setText(self._zone_summary(self.engine.parking_service.zone))
+        self._finish_zone_calibration()
+
+    def _finish_zone_calibration(self) -> None:
+        self.run_button.setEnabled(True)
+        self.reset_button.setEnabled(True)
+        if self._calibration_was_running:
+            if self.active_source == "video":
+                self.video_controller.set_running(True)
+                self.canvas.set_video_running(True)
+            else:
+                self.engine.set_running(True)
+        self._set_run_button_state(
+            self.video_controller.running if self.active_source == "video" else self.engine.running
+        )
+        self._update_zone_controls()
+
+    def _apply_parking_zone(self, zone: tuple[float, float, float, float]) -> None:
+        self.engine.set_parking_zone(zone)
+        self.video_controller.set_parking_zone(zone)
+        self.settings_store.save_parking_zone(zone)
+        self.zone_value.setText(self._zone_summary(zone))
+        self.statusBar().showMessage("停车区域已保存并同步到模拟与本地视频检测", 6000)
+        self.canvas.update()
+
+    def _reset_default_zone(self) -> None:
+        if self.canvas.calibration_active:
+            self.canvas.cancel_zone_calibration()
+            self._finish_zone_calibration()
+        self._apply_parking_zone(DEFAULT_PARKING_ZONE)
+
+    def _update_zone_controls(self) -> None:
+        calibrating = self.canvas.calibration_active
+        self.calibrate_zone_button.setVisible(not calibrating)
+        self.reset_zone_button.setVisible(not calibrating)
+        self.confirm_zone_button.setVisible(calibrating)
+        self.cancel_zone_button.setVisible(calibrating)
+
+    @staticmethod
+    def _zone_summary(zone: tuple[float, float, float, float]) -> str:
+        left, top, right, bottom = zone
+        return (
+            f"左 {left:.0%} · 上 {top:.0%}\n"
+            f"右 {right:.0%} · 下 {bottom:.0%}"
+        )
 
     def _handle_event(self, event: MonitorEvent) -> None:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -496,8 +628,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"截图已保存：{path}", 5000)
 
     def _focus_events(self) -> None:
+        self.pages.setCurrentWidget(self.monitor_workspace)
         self.event_table.setFocus()
         self.event_table.scrollToTop()
+
+    def show_training(self) -> None:
+        if self.canvas.calibration_active:
+            self._cancel_zone_calibration()
+        if self.active_source == "video":
+            self.video_controller.set_running(False)
+            self.canvas.set_video_running(False)
+        else:
+            self.engine.set_running(False)
+        self._set_run_button_state(False)
+        self.training_nav.setChecked(True)
+        self.pages.setCurrentWidget(self.training_page)
 
     def _show_sdk_info(self) -> None:
         QMessageBox.information(
@@ -510,6 +655,19 @@ class MainWindow(QMainWindow):
             "3. 道路/停车预置点切换\n"
             "4. 切换期间暂停分析并清空跟踪状态",
         )
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.video_controller.close()
+        self.training_page.shutdown()
+        super().closeEvent(event)
+
+    def _set_run_button_state(self, running: bool) -> None:
+        if running:
+            self.run_button.setText("暂停分析")
+            self.run_button.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaPause))
+        else:
+            self.run_button.setText("继续分析")
+            self.run_button.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaPlay))
 
     @staticmethod
     def _nav_button(text: str) -> QPushButton:
@@ -533,7 +691,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             * { font-family: "Noto Sans SC"; font-size: 13px; }
-            QMainWindow, #shell, #workspace { background: #f3f5f6; }
+            QMainWindow, #shell, #workspace, QStackedWidget { background: #f3f5f6; }
             #sidebar { background: #20292e; border: none; }
             #brand { color: #ffffff; font-size: 20px; font-weight: 700; line-height: 1.35; }
             #brandSub { color: #91a0a7; font-size: 11px; }
@@ -550,6 +708,8 @@ class MainWindow(QMainWindow):
             #pageSubtitle { color: #748087; font-size: 12px; }
             #sourceStatus { color: #198a70; background: #e3f4ef; border: 1px solid #c4e6dc;
                             border-radius: 5px; padding: 7px 11px; font-size: 11px; }
+            #environmentStatus { color: #a06a12; font-size: 12px; font-weight: 700; }
+            #environmentStatus[ready="true"] { color: #198a70; }
             #toolbar, #panel, #metricCard { background: #ffffff; border: 1px solid #dce2e5; border-radius: 6px; }
             #metricTitle { color: #78858b; font-size: 11px; }
             #metricValue { color: #1e282d; font-size: 23px; font-weight: 700; }
@@ -565,12 +725,17 @@ class MainWindow(QMainWindow):
             #panelTitle { color: #29343a; font-size: 15px; font-weight: 700; }
             #panelHint { color: #7a878d; font-size: 11px; }
             #fieldLabel { color: #606e75; font-size: 11px; margin-top: 3px; }
-            QDoubleSpinBox { background: #f8fafb; border: 1px solid #d4dcdf; border-radius: 4px;
+            QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit { background: #f8fafb;
+                             border: 1px solid #d4dcdf; border-radius: 4px;
                              padding: 7px 9px; min-height: 22px; }
             #readOnlyValue, #readOnlyValueWarning { background: #f5f7f8; border: 1px solid #d7dee1;
                                                    border-radius: 4px; padding: 9px; color: #425158; }
             #readOnlyValueWarning { color: #a06a12; background: #fff7e5; border-color: #ead6aa; }
             #pipeline { color: #66757c; font-size: 11px; line-height: 1.5; }
+            #datasetStatus { color: #5f6d74; background: #f3f6f7; border: 1px solid #d9e0e3;
+                             border-radius: 4px; padding: 9px; }
+            #trainingLog { background: #172026; color: #d7e0e3; border: none;
+                           border-radius: 4px; padding: 10px; font-family: Consolas; }
             #divider { color: #dfe4e6; }
             QTableWidget { background: #ffffff; alternate-background-color: #f7f9fa; border: none;
                            gridline-color: #e4e9eb; selection-background-color: #e2f2ee;

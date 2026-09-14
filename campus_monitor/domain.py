@@ -8,6 +8,22 @@ from pathlib import Path
 from typing import Iterable
 
 
+DEFAULT_PARKING_ZONE = (0.16, 0.18, 0.82, 0.78)
+
+
+def validate_parking_zone(
+    zone: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    if len(zone) != 4:
+        raise ValueError("停车区域必须包含 left、top、right、bottom 四个坐标")
+    left, top, right, bottom = (float(value) for value in zone)
+    if not all(0.0 <= value <= 1.0 for value in (left, top, right, bottom)):
+        raise ValueError("停车区域坐标必须在 0 到 1 之间")
+    if right - left < 0.02 or bottom - top < 0.02:
+        raise ValueError("停车区域过小，请重新拖拽一个更大的区域")
+    return left, top, right, bottom
+
+
 @dataclass(slots=True)
 class MonitorEvent:
     event_type: str
@@ -44,8 +60,14 @@ class SpeedMeasurementService:
 class ParkingRuleService:
     """Rule-based parking checks used before the Anomalib adapter is connected."""
 
-    def __init__(self, zone: tuple[float, float, float, float] = (0.16, 0.18, 0.82, 0.78)) -> None:
-        self.zone = zone
+    def __init__(
+        self,
+        zone: tuple[float, float, float, float] = DEFAULT_PARKING_ZONE,
+    ) -> None:
+        self.zone = validate_parking_zone(zone)
+
+    def set_zone(self, zone: tuple[float, float, float, float]) -> None:
+        self.zone = validate_parking_zone(zone)
 
     def classify(
         self,
@@ -95,4 +117,3 @@ class EventStore:
 def average(values: Iterable[float]) -> float:
     items = list(values)
     return math.fsum(items) / len(items) if items else 0.0
-

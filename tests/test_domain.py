@@ -1,6 +1,6 @@
 import unittest
 
-from campus_monitor.domain import ParkingRuleService, SpeedMeasurementService
+from campus_monitor.domain import ParkingRuleService, SpeedMeasurementService, validate_parking_zone
 
 
 class SpeedMeasurementServiceTest(unittest.TestCase):
@@ -30,7 +30,16 @@ class ParkingRuleServiceTest(unittest.TestCase):
     def test_accepts_normal_parking(self) -> None:
         self.assertIsNone(self.service.classify((0.2, 0.2, 0.2, 0.1)))
 
+    def test_updates_manually_calibrated_zone(self) -> None:
+        self.service.set_zone((0.2, 0.2, 0.8, 0.8))
+        self.assertEqual(self.service.zone, (0.2, 0.2, 0.8, 0.8))
+
+    def test_rejects_tiny_or_out_of_range_zone(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_parking_zone((0.2, 0.2, 0.21, 0.8))
+        with self.assertRaises(ValueError):
+            validate_parking_zone((-0.1, 0.2, 0.8, 0.8))
+
 
 if __name__ == "__main__":
     unittest.main()
-
