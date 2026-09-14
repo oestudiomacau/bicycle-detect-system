@@ -1,6 +1,9 @@
 .venv/
+.venv-anomalib/
 __pycache__/
 *.pyc
 runtime/
 artifacts/
-
+models/rtdetr_r50vd_coco_o365/
+datasets/*
+!datasets/README.md

@@ -1,6 +1,11 @@
 import unittest
 
-from campus_monitor.domain import ParkingRuleService, SpeedMeasurementService, validate_parking_zone
+from campus_monitor.domain import (
+    ParkingRuleService,
+    SpeedMeasurementService,
+    segments_intersect,
+    validate_parking_zone,
+)
 
 
 class SpeedMeasurementServiceTest(unittest.TestCase):
@@ -12,6 +17,11 @@ class SpeedMeasurementServiceTest(unittest.TestCase):
         service = SpeedMeasurementService(distance_m=12.0, threshold_kmh=15.0)
         self.assertTrue(service.is_violation(15.1))
         self.assertFalse(service.is_violation(15.0))
+
+    def test_arbitrary_line_segment_crossing(self) -> None:
+        diagonal_line = (0.5, 0.2, 0.7, 0.8)
+        self.assertTrue(segments_intersect((0.4, 0.5), (0.8, 0.5), diagonal_line))
+        self.assertFalse(segments_intersect((0.4, 0.05), (0.8, 0.05), diagonal_line))
 
 
 class ParkingRuleServiceTest(unittest.TestCase):
@@ -39,6 +49,11 @@ class ParkingRuleServiceTest(unittest.TestCase):
             validate_parking_zone((0.2, 0.2, 0.21, 0.8))
         with self.assertRaises(ValueError):
             validate_parking_zone((-0.1, 0.2, 0.8, 0.8))
+
+    def test_uses_irregular_polygon_boundary(self) -> None:
+        self.service.set_polygon(((0.1, 0.1), (0.9, 0.2), (0.7, 0.9), (0.2, 0.8)))
+        self.assertIsNone(self.service.classify((0.35, 0.35, 0.15, 0.12)))
+        self.assertEqual(self.service.classify((0.78, 0.7, 0.15, 0.12)), "越界停放")
 
 
 if __name__ == "__main__":

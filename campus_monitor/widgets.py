@@ -3,9 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
+from .domain import LineSegment, Point
 from .simulation import ParkedVehicle, RoadTrack, SimulationEngine
 from .video_analysis import TrackedDetection
 
@@ -38,6 +39,8 @@ class MetricCard(QFrame):
 
 class VideoCanvas(QWidget):
     zone_changed = Signal(object)
+    speed_lines_changed = Signal(object)
+    parking_polygon_changed = Signal(object)
 
     def __init__(self, engine: SimulationEngine, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -46,12 +49,15 @@ class VideoCanvas(QWidget):
         self.real_detections: list[TrackedDetection] = []
         self.source_name = "模拟视频源"
         self.real_video_running = False
-        self.calibration_active = False
+        self.calibration_mode: str | None = None
         self._calibration_start: QPointF | None = None
         self._calibration_end: QPointF | None = None
         self._draft_zone: tuple[float, float, float, float] | None = None
+        self._draft_lines: list[LineSegment] = []
+        self._draft_polygon: list[Point] = []
         self.setObjectName("videoCanvas")
         self.setMinimumSize(650, 370)
+        self.setMouseTracking(True)
         self.engine.frame_changed.connect(self.update)
 
     def paintEvent(self, event) -> None:  # noqa: N802
@@ -72,53 +78,121 @@ class VideoCanvas(QWidget):
     def draft_zone(self) -> tuple[float, float, float, float] | None:
         return self._draft_zone
 
+    @property
+    def calibration_active(self) -> bool:
+        return self.calibration_mode is not None
+
     def begin_zone_calibration(self) -> None:
-        self.calibration_active = True
+        self._begin_calibration("parking_rectangle")
+
+    def begin_speed_line_calibration(self) -> None:
+        self._begin_calibration("speed_lines")
+
+    def begin_parking_boundary_calibration(self) -> None:
+        self._begin_calibration("parking_polygon")
+
+    def _begin_calibration(self, mode: str) -> None:
+        self.calibration_mode = mode
         self._calibration_start = None
         self._calibration_end = None
         self._draft_zone = None
+        self._draft_lines = []
+        self._draft_polygon = []
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.update()
 
     def confirm_zone_calibration(self) -> bool:
-        if not self.calibration_active or self._draft_zone is None:
+        if self.calibration_mode != "parking_rectangle" or self._draft_zone is None:
             return False
         zone = self._draft_zone
         self._finish_calibration()
         self.zone_changed.emit(zone)
         return True
 
+    def confirm_speed_line_calibration(self) -> bool:
+        if self.calibration_mode != "speed_lines" or len(self._draft_lines) != 2:
+            return False
+        lines = tuple(self._draft_lines)
+        self._finish_calibration()
+        self.speed_lines_changed.emit(lines)
+        return True
+
+    def confirm_parking_boundary_calibration(self) -> bool:
+        if self.calibration_mode != "parking_polygon" or len(self._draft_polygon) < 3:
+            return False
+        polygon = tuple(self._draft_polygon)
+        self._finish_calibration()
+        self.parking_polygon_changed.emit(polygon)
+        return True
+
     def cancel_zone_calibration(self) -> None:
         self._finish_calibration()
 
+    def cancel_calibration(self) -> None:
+        self._finish_calibration()
+
     def _finish_calibration(self) -> None:
-        self.calibration_active = False
+        self.calibration_mode = None
         self._calibration_start = None
         self._calibration_end = None
         self._draft_zone = None
+        self._draft_lines = []
+        self._draft_polygon = []
         self.unsetCursor()
         self.update()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if (
             not self.calibration_active
-            or event.button() != Qt.MouseButton.LeftButton
             or not self._content_rect().contains(event.position())
         ):
             super().mousePressEvent(event)
             return
+        if event.button() == Qt.MouseButton.RightButton:
+            if self.calibration_mode == "speed_lines" and self._draft_lines:
+                self._draft_lines.pop()
+            elif self.calibration_mode == "parking_polygon" and self._draft_polygon:
+                self._draft_polygon.pop()
+            self._calibration_start = None
+            event.accept()
+            self.update()
+            return
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        if self.calibration_mode == "parking_polygon":
+            if len(self._draft_polygon) < 12:
+                point = self._point_to_normalized(self._clamp_to_content(event.position()))
+                if not self._draft_polygon or self._point_distance(point, self._draft_polygon[-1]) >= 0.01:
+                    self._draft_polygon.append(point)
+            self._calibration_end = self._clamp_to_content(event.position())
+            event.accept()
+            self.update()
+            return
+        if self.calibration_mode == "speed_lines" and len(self._draft_lines) >= 2:
+            event.accept()
+            return
         self._calibration_start = self._clamp_to_content(event.position())
         self._calibration_end = self._calibration_start
-        self._draft_zone = None
+        if self.calibration_mode == "parking_rectangle":
+            self._draft_zone = None
         event.accept()
         self.update()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if not self.calibration_active or self._calibration_start is None:
+        if not self.calibration_active:
             super().mouseMoveEvent(event)
             return
         self._calibration_end = self._clamp_to_content(event.position())
-        self._draft_zone = self._zone_from_points(self._calibration_start, self._calibration_end)
+        if self.calibration_mode == "parking_polygon":
+            event.accept()
+            self.update()
+            return
+        if self._calibration_start is None:
+            super().mouseMoveEvent(event)
+            return
+        if self.calibration_mode == "parking_rectangle":
+            self._draft_zone = self._zone_from_points(self._calibration_start, self._calibration_end)
         event.accept()
         self.update()
 
@@ -131,7 +205,14 @@ class VideoCanvas(QWidget):
             super().mouseReleaseEvent(event)
             return
         self._calibration_end = self._clamp_to_content(event.position())
-        self._draft_zone = self._zone_from_points(self._calibration_start, self._calibration_end)
+        if self.calibration_mode == "parking_rectangle":
+            self._draft_zone = self._zone_from_points(self._calibration_start, self._calibration_end)
+        elif self.calibration_mode == "speed_lines":
+            line = self._line_from_points(self._calibration_start, self._calibration_end)
+            if line is not None:
+                self._draft_lines.append(line)
+            self._calibration_start = None
+            self._calibration_end = None
         event.accept()
         self.update()
 
@@ -194,6 +275,31 @@ class VideoCanvas(QWidget):
             min(max(point.y(), content.top()), content.bottom()),
         )
 
+    def _point_to_normalized(self, point: QPointF) -> Point:
+        content = self._content_rect()
+        return (
+            (point.x() - content.left()) / content.width(),
+            (point.y() - content.top()) / content.height(),
+        )
+
+    @staticmethod
+    def _point_distance(first: Point, second: Point) -> float:
+        return ((first[0] - second[0]) ** 2 + (first[1] - second[1]) ** 2) ** 0.5
+
+    def _point_from_normalized(self, point: Point, content: QRectF | None = None) -> QPointF:
+        target = content or self._content_rect()
+        return QPointF(
+            target.left() + point[0] * target.width(),
+            target.top() + point[1] * target.height(),
+        )
+
+    def _line_from_points(self, start: QPointF, end: QPointF) -> LineSegment | None:
+        start_normalized = self._point_to_normalized(start)
+        end_normalized = self._point_to_normalized(end)
+        if self._point_distance(start_normalized, end_normalized) < 0.03:
+            return None
+        return (*start_normalized, *end_normalized)
+
     def _zone_from_points(
         self,
         start: QPointF,
@@ -216,9 +322,10 @@ class VideoCanvas(QWidget):
             return
         content = self._content_rect()
         painter.save()
-        painter.setPen(QPen(QColor("#f0b542"), 2, Qt.PenStyle.DashLine))
-        painter.setBrush(QColor(240, 181, 66, 30))
-        if self._draft_zone is not None:
+        hint_text = ""
+        if self.calibration_mode == "parking_rectangle" and self._draft_zone is not None:
+            painter.setPen(QPen(QColor("#f0b542"), 2, Qt.PenStyle.DashLine))
+            painter.setBrush(QColor(240, 181, 66, 30))
             left, top, right, bottom = self._draft_zone
             draft = QRectF(
                 content.left() + left * content.width(),
@@ -227,37 +334,106 @@ class VideoCanvas(QWidget):
                 (bottom - top) * content.height(),
             )
             painter.drawRect(draft)
+            hint_text = "按住鼠标左键拖拽矩形停车区域"
+        elif self.calibration_mode == "parking_rectangle":
+            hint_text = "按住鼠标左键拖拽矩形停车区域"
+        elif self.calibration_mode == "speed_lines":
+            colors = (QColor("#f0b542"), QColor("#31b7c2"))
+            for index, line in enumerate(self._draft_lines):
+                self._paint_line_segment(painter, content, line, colors[index], 3)
+            if self._calibration_start is not None and self._calibration_end is not None:
+                painter.setPen(QPen(colors[len(self._draft_lines)], 3, Qt.PenStyle.DashLine))
+                painter.drawLine(self._calibration_start, self._calibration_end)
+            next_name = "A" if not self._draft_lines else "B"
+            hint_text = (
+                "两条测速线已画好，点击右侧确认"
+                if len(self._draft_lines) == 2
+                else f"拖拽绘制测速线 {next_name}；右键撤销上一条"
+            )
+        elif self.calibration_mode == "parking_polygon":
+            points = [self._point_from_normalized(point, content) for point in self._draft_polygon]
+            if len(points) >= 3:
+                painter.setPen(QPen(QColor("#46c3a2"), 2, Qt.PenStyle.DashLine))
+                painter.setBrush(QColor(70, 195, 162, 30))
+                painter.drawPolygon(QPolygonF(points))
+            elif len(points) >= 2:
+                painter.setPen(QPen(QColor("#46c3a2"), 3))
+                painter.drawPolyline(QPolygonF(points))
+            if points and self._calibration_end is not None:
+                painter.setPen(QPen(QColor("#f0b542"), 2, Qt.PenStyle.DashLine))
+                painter.drawLine(points[-1], self._calibration_end)
+            painter.setBrush(QColor("#f7d58b"))
+            painter.setPen(Qt.PenStyle.NoPen)
+            for point in points:
+                painter.drawEllipse(point, 4, 4)
+            hint_text = f"依次点击边界顶点（已画 {len(points)} 个）；右键撤销，确认后自动闭合"
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor(8, 13, 16, 220))
-        hint = QRectF(content.left() + 14, content.bottom() - 48, 285, 32)
+        hint = QRectF(content.left() + 14, content.bottom() - 48, min(430, content.width() - 28), 32)
         painter.drawRoundedRect(hint, 4, 4)
         painter.setPen(QColor("#f7d58b"))
         painter.setFont(QFont("Noto Sans SC", 9))
-        painter.drawText(hint.adjusted(10, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter, "按住鼠标左键拖拽停车区域")
+        painter.drawText(hint.adjusted(10, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter, hint_text)
         painter.restore()
+
+    @staticmethod
+    def _paint_line_segment(
+        painter: QPainter,
+        content: QRectF,
+        line: LineSegment,
+        color: QColor,
+        width: int = 3,
+    ) -> tuple[QPointF, QPointF]:
+        start = QPointF(
+            content.left() + line[0] * content.width(),
+            content.top() + line[1] * content.height(),
+        )
+        end = QPointF(
+            content.left() + line[2] * content.width(),
+            content.top() + line[3] * content.height(),
+        )
+        painter.setPen(QPen(color, width))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawLine(start, end)
+        return start, end
+
+    def _paint_parking_boundary(self, painter: QPainter, content: QRectF) -> None:
+        points = [
+            self._point_from_normalized(point, content)
+            for point in self.engine.parking_service.polygon
+        ]
+        polygon = QPolygonF(points)
+        painter.setPen(QPen(QColor("#46c3a2"), 3, Qt.PenStyle.DashLine))
+        painter.setBrush(QColor(70, 195, 162, 20))
+        painter.drawPolygon(polygon)
+        if points:
+            first = points[0]
+            self._tag(
+                painter,
+                QRectF(first.x() + 8, first.y() + 8, 105, 24),
+                "规定停车区域",
+                QColor("#46c3a2"),
+            )
 
     def _paint_real_overlays(self, painter: QPainter, video_rect: QRectF) -> None:
         if self.engine.mode == "road":
-            line_a = video_rect.left() + video_rect.width() * self.engine.LINE_A
-            line_b = video_rect.left() + video_rect.width() * self.engine.LINE_B
-            painter.setPen(QPen(QColor("#f0b542"), 3))
-            painter.drawLine(QPointF(line_a, video_rect.top()), QPointF(line_a, video_rect.bottom()))
-            painter.setPen(QPen(QColor("#31b7c2"), 3))
-            painter.drawLine(QPointF(line_b, video_rect.top()), QPointF(line_b, video_rect.bottom()))
-            self._tag(painter, QRectF(line_a + 6, video_rect.top() + 52, 76, 23), "虚拟线 A", QColor("#f0b542"))
-            self._tag(painter, QRectF(line_b + 6, video_rect.top() + 52, 76, 23), "虚拟线 B", QColor("#31b7c2"))
-        else:
-            left, top, right, bottom = self.engine.parking_service.zone
-            zone = QRectF(
-                video_rect.left() + left * video_rect.width(),
-                video_rect.top() + top * video_rect.height(),
-                (right - left) * video_rect.width(),
-                (bottom - top) * video_rect.height(),
+            line_a, line_b = self.engine.speed_service.lines
+            start_a, _ = self._paint_line_segment(painter, video_rect, line_a, QColor("#f0b542"))
+            start_b, _ = self._paint_line_segment(painter, video_rect, line_b, QColor("#31b7c2"))
+            self._tag(
+                painter,
+                QRectF(start_a.x() + 6, start_a.y() + 6, 76, 23),
+                "虚拟线 A",
+                QColor("#f0b542"),
             )
-            painter.setPen(QPen(QColor("#46c3a2"), 3, Qt.PenStyle.DashLine))
-            painter.setBrush(QColor(70, 195, 162, 20))
-            painter.drawRoundedRect(zone, 4, 4)
-            self._tag(painter, QRectF(zone.left() + 8, zone.top() + 8, 105, 24), "规定停车区域", QColor("#46c3a2"))
+            self._tag(
+                painter,
+                QRectF(start_b.x() + 6, start_b.y() + 6, 76, 23),
+                "虚拟线 B",
+                QColor("#31b7c2"),
+            )
+        else:
+            self._paint_parking_boundary(painter, video_rect)
 
         for detection in self.real_detections:
             self._paint_real_detection(painter, video_rect, detection)
@@ -288,7 +464,7 @@ class VideoCanvas(QWidget):
         elif detection.speed_kmh is not None:
             detail = f"{detection.speed_kmh:.1f} km/h"
         else:
-            detail = f"自行车 {detection.confidence:.0%}"
+            detail = f"{detection.label} {detection.confidence:.0%}"
         label_width = min(150.0, max(95.0, box.width() + 32))
         self._tag(
             painter,
@@ -311,18 +487,15 @@ class VideoCanvas(QWidget):
         painter.drawLine(0, int(height * 0.48), width, int(height * 0.48))
         painter.drawLine(0, int(height * 0.70), width, int(height * 0.70))
 
-        line_a_x = int(width * self.engine.LINE_A)
-        line_b_x = int(width * self.engine.LINE_B)
-        painter.setPen(QPen(QColor("#f0b542"), 3))
-        painter.drawLine(line_a_x, int(height * 0.22), line_a_x, height)
-        painter.setPen(QPen(QColor("#31b7c2"), 3))
-        painter.drawLine(line_b_x, int(height * 0.22), line_b_x, height)
-
-        self._tag(painter, QRectF(line_a_x + 8, height * 0.25, 78, 25), "虚拟线 A", QColor("#f0b542"))
-        self._tag(painter, QRectF(line_b_x + 8, height * 0.25, 78, 25), "虚拟线 B", QColor("#31b7c2"))
+        content = QRectF(self.rect())
+        line_a, line_b = self.engine.speed_service.lines
+        start_a, _ = self._paint_line_segment(painter, content, line_a, QColor("#f0b542"))
+        start_b, _ = self._paint_line_segment(painter, content, line_b, QColor("#31b7c2"))
+        self._tag(painter, QRectF(start_a.x() + 8, start_a.y() + 8, 78, 25), "虚拟线 A", QColor("#f0b542"))
+        self._tag(painter, QRectF(start_b.x() + 8, start_b.y() + 8, 78, 25), "虚拟线 B", QColor("#31b7c2"))
         self._tag(
             painter,
-            QRectF((line_a_x + line_b_x) / 2 - 56, height * 0.89, 112, 26),
+            QRectF(width / 2 - 56, height * 0.89, 112, 26),
             f"实际距离 {self.engine.speed_service.distance_m:.1f} m",
             QColor("#d9dee0"),
         )
@@ -362,12 +535,7 @@ class VideoCanvas(QWidget):
         for y in range(0, height, 45):
             painter.drawLine(0, y, width, y)
 
-        left, top, right, bottom = self.engine.parking_service.zone
-        zone = QRectF(left * width, top * height, (right - left) * width, (bottom - top) * height)
-        painter.setPen(QPen(QColor("#46c3a2"), 3, Qt.PenStyle.DashLine))
-        painter.setBrush(QColor(70, 195, 162, 20))
-        painter.drawRoundedRect(zone, 4, 4)
-        self._tag(painter, QRectF(zone.left() + 10, zone.top() + 10, 105, 25), "规定停车区域", QColor("#46c3a2"))
+        self._paint_parking_boundary(painter, QRectF(self.rect()))
 
         for vehicle in self.engine.parked_vehicles:
             self._paint_parked_vehicle(painter, vehicle)

@@ -5,7 +5,14 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from .domain import MonitorEvent, ParkingRuleService, SpeedMeasurementService
+from .domain import (
+    LineSegment,
+    MonitorEvent,
+    ParkingRuleService,
+    Point,
+    SpeedMeasurementService,
+    segments_intersect,
+)
 
 
 @dataclass(slots=True)
@@ -14,7 +21,8 @@ class RoadTrack:
     x: float
     y: float
     target_speed_kmh: float
-    crossed_a_at: float | None = None
+    first_line: str | None = None
+    first_crossed_at: float | None = None
     measured_speed_kmh: float | None = None
     emitted: bool = False
 
@@ -33,9 +41,6 @@ class SimulationEngine(QObject):
     frame_changed = Signal()
     event_raised = Signal(object)
     metrics_changed = Signal(dict)
-
-    LINE_A = 0.30
-    LINE_B = 0.68
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -73,8 +78,24 @@ class SimulationEngine(QObject):
         self.speed_service.distance_m = distance_m
         self.speed_service.threshold_kmh = threshold_kmh
 
+    def set_speed_lines(self, lines: tuple[LineSegment, LineSegment]) -> None:
+        self.speed_service.set_lines(lines)
+        for track in self.road_tracks:
+            track.first_line = None
+            track.first_crossed_at = None
+            track.measured_speed_kmh = None
+            track.emitted = False
+        self.frame_changed.emit()
+
     def set_parking_zone(self, zone: tuple[float, float, float, float]) -> None:
         self.parking_service.set_zone(zone)
+        self.parked_vehicles = self._build_parking_scene()
+        self._parking_events_emitted = False
+        self.frame_changed.emit()
+        self._emit_metrics()
+
+    def set_parking_polygon(self, polygon: tuple[Point, ...]) -> None:
+        self.parking_service.set_polygon(polygon)
         self.parked_vehicles = self._build_parking_scene()
         self._parking_events_emitted = False
         self.frame_changed.emit()
@@ -104,23 +125,36 @@ class SimulationEngine(QObject):
         self._emit_metrics()
 
     def _update_road(self, dt: float) -> None:
-        line_gap = self.LINE_B - self.LINE_A
+        line_a, line_b = self.speed_service.lines
         for track in self.road_tracks:
+            line_gap = max(
+                0.05,
+                abs(self._line_x_at_y(line_b, track.y) - self._line_x_at_y(line_a, track.y)),
+            )
             travel_time = self.speed_service.distance_m / (track.target_speed_kmh / 3.6)
-            previous_x = track.x
+            previous = (track.x, track.y)
             track.x += line_gap / travel_time * dt
+            current = (track.x, track.y)
+            crossed_a = segments_intersect(previous, current, line_a)
+            crossed_b = segments_intersect(previous, current, line_b)
 
-            if previous_x < self.LINE_A <= track.x:
-                track.crossed_a_at = self.elapsed_s
+            if track.first_line is None:
+                if crossed_a:
+                    track.first_line = "A"
+                    track.first_crossed_at = self.elapsed_s
+                elif crossed_b:
+                    track.first_line = "B"
+                    track.first_crossed_at = self.elapsed_s
                 track.measured_speed_kmh = None
                 track.emitted = False
 
-            if (
-                previous_x < self.LINE_B <= track.x
-                and track.crossed_a_at is not None
-                and not track.emitted
-            ):
-                speed = self.speed_service.calculate_kmh(track.crossed_a_at, self.elapsed_s)
+            completed = (
+                track.first_line == "A" and crossed_b
+            ) or (
+                track.first_line == "B" and crossed_a
+            )
+            if completed and track.first_crossed_at is not None and not track.emitted:
+                speed = self.speed_service.calculate_kmh(track.first_crossed_at, self.elapsed_s)
                 track.measured_speed_kmh = speed
                 track.emitted = True
                 violation = self.speed_service.is_violation(speed)
@@ -138,9 +172,18 @@ class SimulationEngine(QObject):
             if track.x > 1.12:
                 track.x = random.uniform(-0.24, -0.08)
                 track.target_speed_kmh = random.choice([9.8, 12.6, 16.4, 20.2, 23.5])
-                track.crossed_a_at = None
+                track.first_line = None
+                track.first_crossed_at = None
                 track.measured_speed_kmh = None
                 track.emitted = False
+
+    @staticmethod
+    def _line_x_at_y(line: LineSegment, y: float) -> float:
+        x1, y1, x2, y2 = line
+        if abs(y2 - y1) < 1e-9:
+            return (x1 + x2) / 2
+        ratio = (y - y1) / (y2 - y1)
+        return x1 + (x2 - x1) * ratio
 
     def _update_parking(self) -> None:
         if self._parking_events_emitted or self.elapsed_s < 0.6:

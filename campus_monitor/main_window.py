@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -26,12 +27,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .domain import DEFAULT_PARKING_ZONE, EventStore, MonitorEvent
+from .domain import (
+    DEFAULT_PARKING_POLYGON,
+    DEFAULT_SPEED_LINES,
+    EventStore,
+    LineSegment,
+    MonitorEvent,
+    Point,
+)
 from .integrations import HikvisionSdkAdapter, ParkingAnomalyAdapter
 from .settings import SettingsStore
 from .simulation import SimulationEngine
 from .training_page import AnomalibTrainingPage
-from .video_analysis import VideoAnalysisController
+from .video_analysis import RTDetrWorkerDetector, VideoAnalysisController
 from .widgets import MetricCard, VideoCanvas
 
 
@@ -50,10 +58,18 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1180, 760)
 
         self.engine = SimulationEngine(self)
+        rtdetr = RTDetrWorkerDetector(
+            ROOT / ".venv-anomalib" / "Scripts" / "python.exe",
+            ROOT / "scripts" / "rtdetr_worker.py",
+            MODEL_DIR / "rtdetr_r50vd_coco_o365",
+            RUNTIME_DIR,
+        )
         self.video_controller = VideoAnalysisController(
             MODEL_DIR / "mobilenet_ssd.prototxt",
             MODEL_DIR / "mobilenet_ssd.caffemodel",
-            self,
+            yolox_weights=MODEL_DIR / "yolox_tiny.onnx",
+            rtdetr=rtdetr,
+            parent=self,
         )
         self.active_source = "simulation"
         self.event_store = EventStore(RUNTIME_DIR / "events.jsonl")
@@ -63,9 +79,12 @@ class MainWindow(QMainWindow):
         self.events: list[MonitorEvent] = self.event_store.load()
         self.warning_count = sum(1 for item in self.events if item.severity == "warning")
         self._calibration_was_running = False
-        parking_zone = self.settings_store.load_parking_zone()
-        self.engine.set_parking_zone(parking_zone)
-        self.video_controller.set_parking_zone(parking_zone)
+        parking_polygon = self.settings_store.load_parking_polygon()
+        speed_lines = self.settings_store.load_speed_lines()
+        self.engine.set_parking_polygon(parking_polygon)
+        self.video_controller.set_parking_polygon(parking_polygon)
+        self.engine.set_speed_lines(speed_lines)
+        self.video_controller.set_speed_lines(speed_lines)
 
         self._apply_theme()
         self._build_ui()
@@ -75,7 +94,12 @@ class MainWindow(QMainWindow):
         self.video_controller.event_raised.connect(self._handle_event)
         self.video_controller.metrics_changed.connect(self._update_metrics)
         self.video_controller.status_changed.connect(self._update_source_status)
+        self.video_controller.detector_status_changed.connect(
+            self._update_detector_status
+        )
         self.canvas.zone_changed.connect(self._apply_parking_zone)
+        self.canvas.speed_lines_changed.connect(self._apply_speed_lines)
+        self.canvas.parking_polygon_changed.connect(self._apply_parking_polygon)
         self.training_page.status_changed.connect(
             lambda message: self.statusBar().showMessage(message, 7000)
         )
@@ -280,6 +304,20 @@ class MainWindow(QMainWindow):
         import_button.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_DirOpenIcon))
         import_button.clicked.connect(self._choose_video)
         layout.addWidget(import_button)
+        startup_button = QPushButton("自定义示范")
+        startup_button.setIcon(
+            self.style().standardIcon(self.style().StandardPixmap.SP_MediaPlay)
+        )
+        startup_menu = QMenu(startup_button)
+        startup_menu.addAction("选择并设为启动示范").triggered.connect(
+            self._choose_startup_video
+        )
+        startup_menu.addAction("取消启动自动播放").triggered.connect(
+            self._clear_startup_video
+        )
+        startup_button.setMenu(startup_menu)
+        startup_button.setToolTip("保存当前监测模式，并在下次启动时自动播放")
+        layout.addWidget(startup_button)
         snapshot_button = QPushButton("保存截图")
         snapshot_button.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_DialogSaveButton))
         snapshot_button.clicked.connect(self._save_manual_snapshot)
@@ -319,39 +357,71 @@ class MainWindow(QMainWindow):
         self.threshold_spin.setSuffix(" km/h")
         self.threshold_spin.valueChanged.connect(self._speed_config_changed)
 
-        self.zone_label = QLabel("停车区域")
+        self.detector_label = QLabel("车辆检测模型")
+        self.detector_value = QLabel(self.video_controller.detector.status_text)
+        self.detector_value.setObjectName("readOnlyValue")
+        self.detector_value.setWordWrap(True)
+
+        self.speed_line_label = QLabel("测速虚拟线")
+        self.speed_line_value = QLabel("虚拟线 A / B · 已配置")
+        self.speed_line_value.setObjectName("readOnlyValue")
+        speed_line_actions = QHBoxLayout()
+        speed_line_actions.setSpacing(6)
+        self.calibrate_speed_button = QPushButton("绘制 A / B")
+        self.calibrate_speed_button.clicked.connect(self._start_speed_line_calibration)
+        self.reset_speed_button = QPushButton("恢复默认")
+        self.reset_speed_button.clicked.connect(self._reset_default_speed_lines)
+        self.confirm_speed_button = QPushButton("确认两条线")
+        self.confirm_speed_button.setObjectName("primaryButton")
+        self.confirm_speed_button.clicked.connect(self._confirm_speed_line_calibration)
+        self.cancel_speed_button = QPushButton("取消")
+        self.cancel_speed_button.clicked.connect(self._cancel_calibration)
+        for button in (
+            self.calibrate_speed_button,
+            self.reset_speed_button,
+            self.confirm_speed_button,
+            self.cancel_speed_button,
+        ):
+            speed_line_actions.addWidget(button)
+
+        self.zone_label = QLabel("停车边界")
         self.zone_value = QLabel("ROI 01 · 已配置")
         self.zone_value.setObjectName("readOnlyValue")
-        zone_actions = QHBoxLayout()
+        zone_actions = QGridLayout()
         zone_actions.setSpacing(6)
-        self.calibrate_zone_button = QPushButton("标定区域")
+        self.calibrate_zone_button = QPushButton("框选矩形")
         self.calibrate_zone_button.clicked.connect(self._start_zone_calibration)
+        self.draw_boundary_button = QPushButton("绘制边界")
+        self.draw_boundary_button.clicked.connect(self._start_parking_boundary_calibration)
         self.reset_zone_button = QPushButton("恢复默认")
         self.reset_zone_button.clicked.connect(self._reset_default_zone)
         self.confirm_zone_button = QPushButton("确认区域")
         self.confirm_zone_button.setObjectName("primaryButton")
         self.confirm_zone_button.clicked.connect(self._confirm_zone_calibration)
         self.cancel_zone_button = QPushButton("取消")
-        self.cancel_zone_button.clicked.connect(self._cancel_zone_calibration)
-        zone_actions.addWidget(self.calibrate_zone_button)
-        zone_actions.addWidget(self.reset_zone_button)
-        zone_actions.addWidget(self.confirm_zone_button)
-        zone_actions.addWidget(self.cancel_zone_button)
-        self.confirm_zone_button.hide()
-        self.cancel_zone_button.hide()
+        self.cancel_zone_button.clicked.connect(self._cancel_calibration)
+        zone_actions.addWidget(self.calibrate_zone_button, 0, 0)
+        zone_actions.addWidget(self.draw_boundary_button, 0, 1)
+        zone_actions.addWidget(self.reset_zone_button, 1, 0, 1, 2)
+        zone_actions.addWidget(self.confirm_zone_button, 0, 0)
+        zone_actions.addWidget(self.cancel_zone_button, 0, 1)
         self.model_label = QLabel("状态异常模型")
         self.model_value = QLabel("Anomalib 2.6.2 · 可训练")
         self.model_value.setObjectName("readOnlyValueWarning")
 
         for label, widget in (
+            (self.detector_label, self.detector_value),
             (self.distance_label, self.distance_spin),
             (self.threshold_label, self.threshold_spin),
+            (self.speed_line_label, self.speed_line_value),
             (self.zone_label, self.zone_value),
             (self.model_label, self.model_value),
         ):
             label.setObjectName("fieldLabel")
             layout.addWidget(label)
             layout.addWidget(widget)
+            if widget is self.speed_line_value:
+                layout.addLayout(speed_line_actions)
             if widget is self.zone_value:
                 layout.addLayout(zone_actions)
 
@@ -389,8 +459,12 @@ class MainWindow(QMainWindow):
         return table
 
     def select_mode(self, mode: str) -> None:
-        if hasattr(self, "canvas") and self.canvas.calibration_active and mode != "parking":
-            self._cancel_zone_calibration()
+        if (
+            hasattr(self, "canvas")
+            and self.canvas.calibration_active
+            and mode != self.engine.mode
+        ):
+            self._cancel_calibration()
         if hasattr(self, "pages"):
             self.pages.setCurrentWidget(self.monitor_workspace)
         self.engine.set_mode(mode)
@@ -419,20 +493,16 @@ class MainWindow(QMainWindow):
         self.distance_spin.setVisible(road)
         self.threshold_label.setVisible(road)
         self.threshold_spin.setVisible(road)
+        self.speed_line_label.setVisible(road)
+        self.speed_line_value.setVisible(road)
         self.zone_label.setVisible(not road)
         self.zone_value.setVisible(not road)
         self.model_label.setVisible(not road)
         self.model_value.setVisible(not road)
-        for button in (
-            self.calibrate_zone_button,
-            self.reset_zone_button,
-            self.confirm_zone_button,
-            self.cancel_zone_button,
-        ):
-            button.setVisible(not road and (button.isVisible() or not self.canvas.calibration_active))
-        if not road:
-            self._update_zone_controls()
-            self.zone_value.setText(self._zone_summary(self.engine.parking_service.zone))
+        self.speed_line_value.setText(self._speed_lines_summary(self.engine.speed_service.lines))
+        self.zone_value.setText(self._polygon_summary(self.engine.parking_service.polygon))
+        self.detector_value.setText(self.video_controller.detector.status_text)
+        self._update_calibration_controls()
         self.pipeline_label.setText(
             "处理链路\n模拟取流 → 目标跟踪 → 双线计时 → 速度计算 → 阈值告警"
             if road
@@ -460,10 +530,10 @@ class MainWindow(QMainWindow):
         self.video_controller.set_speed_config(self.distance_spin.value(), self.threshold_spin.value())
         self.canvas.update()
 
-    def _start_zone_calibration(self) -> None:
-        self.select_mode("parking")
+    def _prepare_calibration(self, mode: str) -> bool:
+        self.select_mode(mode)
         if self.canvas.calibration_active:
-            return
+            return False
         self._calibration_was_running = (
             self.video_controller.running if self.active_source == "video" else self.engine.running
         )
@@ -472,26 +542,56 @@ class MainWindow(QMainWindow):
             self.canvas.set_video_running(False)
         else:
             self.engine.set_running(False)
-        self.canvas.begin_zone_calibration()
         self.run_button.setEnabled(False)
         self.reset_button.setEnabled(False)
+        return True
+
+    def _start_speed_line_calibration(self) -> None:
+        if not self._prepare_calibration("road"):
+            return
+        self.canvas.begin_speed_line_calibration()
+        self.speed_line_value.setText("请依次拖拽绘制虚拟线 A、B")
+        self._update_calibration_controls()
+
+    def _start_zone_calibration(self) -> None:
+        if not self._prepare_calibration("parking"):
+            return
+        self.canvas.begin_zone_calibration()
         self.zone_value.setText("请在画面中拖拽一个矩形区域")
-        self._update_zone_controls()
+        self._update_calibration_controls()
+
+    def _start_parking_boundary_calibration(self) -> None:
+        if not self._prepare_calibration("parking"):
+            return
+        self.canvas.begin_parking_boundary_calibration()
+        self.zone_value.setText("依次点击顶点，用线段围出停车区域")
+        self._update_calibration_controls()
+
+    def _confirm_speed_line_calibration(self) -> None:
+        if not self.canvas.confirm_speed_line_calibration():
+            QMessageBox.information(self, "测速线标定", "请先依次拖拽绘制虚拟线 A 和 B。")
+            return
+        self._finish_calibration_session()
 
     def _confirm_zone_calibration(self) -> None:
-        if not self.canvas.confirm_zone_calibration():
+        if self.canvas.calibration_mode == "parking_polygon":
+            if not self.canvas.confirm_parking_boundary_calibration():
+                QMessageBox.information(self, "停车边界标定", "请至少点击 3 个边界顶点。")
+                return
+        elif not self.canvas.confirm_zone_calibration():
             QMessageBox.information(self, "停车区域标定", "请先在画面中按住鼠标拖拽停车区域。")
             return
-        self._finish_zone_calibration()
+        self._finish_calibration_session()
 
-    def _cancel_zone_calibration(self) -> None:
+    def _cancel_calibration(self) -> None:
         if not self.canvas.calibration_active:
             return
-        self.canvas.cancel_zone_calibration()
-        self.zone_value.setText(self._zone_summary(self.engine.parking_service.zone))
-        self._finish_zone_calibration()
+        self.canvas.cancel_calibration()
+        self.speed_line_value.setText(self._speed_lines_summary(self.engine.speed_service.lines))
+        self.zone_value.setText(self._polygon_summary(self.engine.parking_service.polygon))
+        self._finish_calibration_session()
 
-    def _finish_zone_calibration(self) -> None:
+    def _finish_calibration_session(self) -> None:
         self.run_button.setEnabled(True)
         self.reset_button.setEnabled(True)
         if self._calibration_was_running:
@@ -503,36 +603,71 @@ class MainWindow(QMainWindow):
         self._set_run_button_state(
             self.video_controller.running if self.active_source == "video" else self.engine.running
         )
-        self._update_zone_controls()
+        self._update_calibration_controls()
+
+    def _apply_speed_lines(self, lines: tuple[LineSegment, LineSegment]) -> None:
+        self.engine.set_speed_lines(lines)
+        self.video_controller.set_speed_lines(lines)
+        self.settings_store.save_speed_lines(lines)
+        self.speed_line_value.setText(self._speed_lines_summary(lines))
+        self.statusBar().showMessage("测速虚拟线 A、B 已保存并开始参与过线判断", 6000)
+        self.canvas.update()
 
     def _apply_parking_zone(self, zone: tuple[float, float, float, float]) -> None:
         self.engine.set_parking_zone(zone)
         self.video_controller.set_parking_zone(zone)
         self.settings_store.save_parking_zone(zone)
-        self.zone_value.setText(self._zone_summary(zone))
+        self.zone_value.setText(self._polygon_summary(self.engine.parking_service.polygon))
         self.statusBar().showMessage("停车区域已保存并同步到模拟与本地视频检测", 6000)
         self.canvas.update()
 
+    def _apply_parking_polygon(self, polygon: tuple[Point, ...]) -> None:
+        self.engine.set_parking_polygon(polygon)
+        self.video_controller.set_parking_polygon(polygon)
+        self.settings_store.save_parking_polygon(polygon)
+        self.zone_value.setText(self._polygon_summary(polygon))
+        self.statusBar().showMessage("停车边界线已保存，闭合区域外将判为越界停放", 6000)
+        self.canvas.update()
+
+    def _reset_default_speed_lines(self) -> None:
+        if self.canvas.calibration_active:
+            self._cancel_calibration()
+        self._apply_speed_lines(DEFAULT_SPEED_LINES)
+
     def _reset_default_zone(self) -> None:
         if self.canvas.calibration_active:
-            self.canvas.cancel_zone_calibration()
-            self._finish_zone_calibration()
-        self._apply_parking_zone(DEFAULT_PARKING_ZONE)
+            self._cancel_calibration()
+        self._apply_parking_polygon(DEFAULT_PARKING_POLYGON)
 
-    def _update_zone_controls(self) -> None:
-        calibrating = self.canvas.calibration_active
-        self.calibrate_zone_button.setVisible(not calibrating)
-        self.reset_zone_button.setVisible(not calibrating)
-        self.confirm_zone_button.setVisible(calibrating)
-        self.cancel_zone_button.setVisible(calibrating)
+    def _update_calibration_controls(self) -> None:
+        road = self.engine.mode == "road"
+        speed_calibrating = self.canvas.calibration_mode == "speed_lines"
+        parking_calibrating = self.canvas.calibration_mode in {
+            "parking_rectangle",
+            "parking_polygon",
+        }
+        self.calibrate_speed_button.setVisible(road and not speed_calibrating)
+        self.reset_speed_button.setVisible(road and not speed_calibrating)
+        self.confirm_speed_button.setVisible(road and speed_calibrating)
+        self.cancel_speed_button.setVisible(road and speed_calibrating)
+        self.calibrate_zone_button.setVisible(not road and not parking_calibrating)
+        self.draw_boundary_button.setVisible(not road and not parking_calibrating)
+        self.reset_zone_button.setVisible(not road and not parking_calibrating)
+        self.confirm_zone_button.setVisible(not road and parking_calibrating)
+        self.cancel_zone_button.setVisible(not road and parking_calibrating)
 
     @staticmethod
-    def _zone_summary(zone: tuple[float, float, float, float]) -> str:
-        left, top, right, bottom = zone
-        return (
-            f"左 {left:.0%} · 上 {top:.0%}\n"
-            f"右 {right:.0%} · 下 {bottom:.0%}"
-        )
+    def _speed_lines_summary(lines: tuple[LineSegment, LineSegment]) -> str:
+        line_a, line_b = lines
+        return f"A 长度 {MainWindow._line_length(line_a):.0%} · B 长度 {MainWindow._line_length(line_b):.0%}"
+
+    @staticmethod
+    def _line_length(line: LineSegment) -> float:
+        return ((line[2] - line[0]) ** 2 + (line[3] - line[1]) ** 2) ** 0.5
+
+    @staticmethod
+    def _polygon_summary(polygon: tuple[Point, ...]) -> str:
+        return f"{len(polygon)} 个边界点 · 闭合区域已配置"
 
     def _handle_event(self, event: MonitorEvent) -> None:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
@@ -586,20 +721,56 @@ class MainWindow(QMainWindow):
         if path:
             self.load_video(Path(path))
 
-    def load_video(self, path: Path, mode: str | None = None) -> None:
+    def _choose_startup_video(self) -> None:
+        configured = self.settings_store.load_startup_video()
+        initial = configured[0].parent if configured else SAMPLE_VIDEO_DIR
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择启动示范视频",
+            str(initial),
+            "视频文件 (*.mp4 *.avi *.mov *.mkv);;所有文件 (*)",
+        )
+        if not path:
+            return
+        video_path = Path(path)
+        mode = self.engine.mode
+        if self.load_video(video_path, mode):
+            self.settings_store.save_startup_video(video_path, mode)
+            mode_name = "停车检测" if mode == "parking" else "速度检测"
+            self.statusBar().showMessage(
+                f"已设为启动示范：{video_path.name} · {mode_name}",
+                6000,
+            )
+
+    def _clear_startup_video(self) -> None:
+        self.settings_store.clear_startup_video()
+        self.statusBar().showMessage("已取消启动示范视频", 5000)
+
+    def load_startup_video(self) -> bool:
+        if not self.settings_store.startup_video_enabled():
+            return False
+        configured = self.settings_store.load_startup_video()
+        if configured is None:
+            path, mode = SAMPLE_VIDEO_DIR / "road_cyclists.mp4", "road"
+        else:
+            path, mode = configured
+        return self.load_video(path, mode)
+
+    def load_video(self, path: Path, mode: str | None = None) -> bool:
         if mode:
             self.select_mode(mode)
         try:
             self.video_controller.open(path)
         except (OSError, RuntimeError) as error:
             QMessageBox.warning(self, "无法加载视频", str(error))
-            return
+            return False
         self.active_source = "video"
         self.engine.set_running(False)
         self.canvas.set_video_running(True)
         self.reset_button.setText("重新播放")
         self.run_button.setText("暂停分析")
         self.run_button.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_MediaPause))
+        return True
 
     def _use_simulation_source(self) -> None:
         self.video_controller.close()
@@ -621,6 +792,9 @@ class MainWindow(QMainWindow):
     def _update_source_status(self, text: str) -> None:
         self.source_status.setText(f"●  {text}")
 
+    def _update_detector_status(self, text: str) -> None:
+        self.detector_value.setText(text)
+
     def _save_manual_snapshot(self) -> None:
         SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
         path = SNAPSHOT_DIR / f"manual_{datetime.now():%Y%m%d_%H%M%S}.png"
@@ -634,7 +808,7 @@ class MainWindow(QMainWindow):
 
     def show_training(self) -> None:
         if self.canvas.calibration_active:
-            self._cancel_zone_calibration()
+            self._cancel_calibration()
         if self.active_source == "video":
             self.video_controller.set_running(False)
             self.canvas.set_video_running(False)
@@ -657,7 +831,7 @@ class MainWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self.video_controller.close()
+        self.video_controller.shutdown()
         self.training_page.shutdown()
         super().closeEvent(event)
 
@@ -725,9 +899,11 @@ class MainWindow(QMainWindow):
             #panelTitle { color: #29343a; font-size: 15px; font-weight: 700; }
             #panelHint { color: #7a878d; font-size: 11px; }
             #fieldLabel { color: #606e75; font-size: 11px; margin-top: 3px; }
-            QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit { background: #f8fafb;
+            QDoubleSpinBox, QSpinBox, QComboBox, QLineEdit { background: #f8fafb; color: #20292e;
                              border: 1px solid #d4dcdf; border-radius: 4px;
                              padding: 7px 9px; min-height: 22px; }
+            QLineEdit:disabled, QLineEdit:read-only { color: #4f5d63; }
+            QLineEdit { selection-background-color: #267e6b; selection-color: #ffffff; }
             #readOnlyValue, #readOnlyValueWarning { background: #f5f7f8; border: 1px solid #d7dee1;
                                                    border-radius: 4px; padding: 9px; color: #425158; }
             #readOnlyValueWarning { color: #a06a12; background: #fff7e5; border-color: #ead6aa; }
