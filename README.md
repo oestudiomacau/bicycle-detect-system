@@ -45,7 +45,7 @@ RT-DETR R50 权重约 172MB，不会提交到 GitHub。首次使用执行：
 .\.venv\Scripts\python.exe scripts\setup_rtdetr_model.py
 ```
 
-RTX 2060 默认使用 CUDA 12.6。安装后直接启动 GUI，右侧“车辆检测模型”会从
+默认使用 CUDA 12.6。安装后直接启动 GUI，右侧“车辆检测模型”会从
 “RT-DETR R50 正在加载”切换为“Hugging Face RT-DETR R50 · CUDA”。未安装时软件仍会
 使用内置 YOLOX-Tiny。
 
@@ -110,8 +110,7 @@ Anomalib 接入位于同文件的 `ParkingAnomalyAdapter`。真实检测阶段�
 
 - 默认模型：PatchCore + ResNet18
 - 轻量备选：PaDiM + ResNet18
-- 推荐设备：RTX 2060 使用 CUDA 12.6
-- 已在 RTX 2060 6GB 上验证；默认 `256 px / batch 4`，显存不足时将 batch 调到 1 或 2
+- 默认 `256 px / batch 4`，显存不足时将 batch 调到 1 或 2
 - 输入数据：正常停车图片必需，异常测试图片可选
 - 输出位置：`artifacts/anomalib/<训练时间>/`
 - 导出结果：Torch `.pt`，以及可选的 OpenVINO 模型
