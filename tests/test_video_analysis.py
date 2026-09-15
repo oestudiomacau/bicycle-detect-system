@@ -9,6 +9,8 @@ from campus_monitor.video_analysis import (
     Detection,
     MobileNetBicycleDetector,
     RTDetrWorkerDetector,
+    TwoWheelerDetector,
+    analyze_image,
     YoloXTwoWheelerDetector,
 )
 
@@ -57,6 +59,24 @@ class SampleVideoDetectionTest(unittest.TestCase):
         detections = self.yolox_detector.detect(frame)
 
         self.assertGreaterEqual(len(detections), 5)
+
+    def test_analyzes_image_with_current_detector(self) -> None:
+        frame = self._read_frame(ROOT / "sample_videos" / "parking_dense.mp4", 90)
+        image_path = ROOT / "runtime" / "test_image_detection.jpg"
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(image_path), frame)
+        detector = TwoWheelerDetector(
+            ROOT / "models" / "mobilenet_ssd.prototxt",
+            ROOT / "models" / "mobilenet_ssd.caffemodel",
+            ROOT / "models" / "yolox_tiny.onnx",
+        )
+        try:
+            image, detections = analyze_image(image_path, detector)
+
+            self.assertEqual((image.width(), image.height()), (frame.shape[1], frame.shape[0]))
+            self.assertGreaterEqual(len(detections), 5)
+        finally:
+            image_path.unlink(missing_ok=True)
 
     @staticmethod
     def _read_frame(path: Path, frame_index: int):

@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QProcess, QProcessEnvironment, QTimer, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QTextCursor
+from PySide6.QtGui import QDesktopServices, QFont, QTextCursor
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -36,6 +36,9 @@ class PathPicker(QWidget):
         layout.setSpacing(6)
         self.line_edit = QLineEdit(str(initial) if initial else "")
         self.line_edit.setClearButtonEnabled(optional)
+        self.line_edit.setToolTip(self.line_edit.text())
+        self.line_edit.textChanged.connect(self.line_edit.setToolTip)
+        self.line_edit.setCursorPosition(0)
         browse = QPushButton()
         browse.setToolTip(f"选择{title}")
         browse.setIcon(self.style().standardIcon(self.style().StandardPixmap.SP_DirOpenIcon))
@@ -94,11 +97,13 @@ class AnomalibTrainingPage(QWidget):
         environment_layout.setContentsMargins(12, 9, 12, 9)
         self.environment_status = QLabel("正在检查训练环境...")
         self.environment_status.setObjectName("environmentStatus")
+        self.environment_status.setMinimumHeight(24)
         environment_layout.addWidget(self.environment_status)
         environment_layout.addStretch()
         self.backend_combo = QComboBox()
         self.backend_combo.addItem("CUDA 12.6 · RTX 2060", "cu126")
         self.backend_combo.addItem("CPU", "cpu")
+        self.backend_combo.setMinimumWidth(180)
         environment_layout.addWidget(self.backend_combo)
         self.check_button = QPushButton("检查环境")
         self.check_button.clicked.connect(self.check_environment)
@@ -164,6 +169,7 @@ class AnomalibTrainingPage(QWidget):
         self.dataset_status = QLabel("尚未检查数据集")
         self.dataset_status.setObjectName("datasetStatus")
         self.dataset_status.setWordWrap(True)
+        self.dataset_status.setMinimumHeight(42)
         config_layout.addWidget(self.dataset_status)
         config_layout.addStretch()
 
@@ -207,6 +213,7 @@ class AnomalibTrainingPage(QWidget):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setObjectName("trainingLog")
+        self.log.setFont(QFont("Microsoft YaHei UI", 10))
         self.log.setPlaceholderText("环境检查、训练进度和模型导出结果会显示在这里。")
         log_layout.addWidget(self.log, 1)
         content.addWidget(log_panel, 1)

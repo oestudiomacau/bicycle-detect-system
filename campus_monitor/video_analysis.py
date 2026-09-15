@@ -6,6 +6,7 @@ import os
 import struct
 import subprocess
 import threading
+import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -222,6 +223,8 @@ class RTDetrWorkerDetector:
         self.process: subprocess.Popen[bytes] | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._future: Future[list[Detection]] | None = None
+        self._future_generation = 0
+        self._generation = 0
         self._last_result: list[Detection] | None = None
         self._io_lock = threading.Lock()
         self._log_handle = None
@@ -313,17 +316,25 @@ class RTDetrWorkerDetector:
             return None
         if self._future is None:
             self._future = self._executor.submit(self._request, frame.copy())
+            self._future_generation = self._generation
             return None
         if not self._future.done():
             return self._last_result
         try:
-            self._last_result = self._future.result()
+            result = self._future.result()
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError):
             self._failed = True
             self._last_result = None
             return None
+        if self._future_generation == self._generation:
+            self._last_result = result
         self._future = self._executor.submit(self._request, frame.copy())
+        self._future_generation = self._generation
         return self._last_result
+
+    def reset_results(self) -> None:
+        self._generation += 1
+        self._last_result = None
 
     def shutdown(self) -> None:
         process = self.process
@@ -451,9 +462,22 @@ class TwoWheelerDetector:
 
     @property
     def status_text(self) -> str:
-        if self.rtdetr is None:
-            return self.name
-        return self.rtdetr.status_text
+        if self.rtdetr is not None and self.rtdetr.ready:
+            return self.rtdetr.status_text
+        if (
+            self.rtdetr is not None
+            and self.rtdetr.available
+            and self.rtdetr.process is not None
+            and self.rtdetr.process.poll() is None
+        ):
+            return "RT-DETR R50 · 加载中"
+        if self.rtdetr is not None and self.rtdetr.available and not self.rtdetr._failed:
+            return "RT-DETR R50 · 待启动"
+        return f"{self.fallback_name} · 回退运行"
+
+    @property
+    def fallback_name(self) -> str:
+        return "YOLOX-Tiny" if self.primary is not None else "MobileNet-SSD"
 
     def start(self) -> None:
         if self.rtdetr is not None:
@@ -463,16 +487,23 @@ class TwoWheelerDetector:
         if self.rtdetr is not None:
             self.rtdetr.shutdown()
 
-    def detect(self, frame: np.ndarray) -> list[Detection]:
+    def reset_results(self) -> None:
         if self.rtdetr is not None:
-            detections = self.rtdetr.detect(frame)
-            if detections is not None:
-                return detections
+            self.rtdetr.reset_results()
+
+    def detect_fallback(self, frame: np.ndarray) -> list[Detection]:
         if self.primary is not None:
             detections = self.primary.detect(frame)
             if detections:
                 return detections
         return self.fallback.detect(frame)
+
+    def detect(self, frame: np.ndarray) -> list[Detection]:
+        if self.rtdetr is not None:
+            detections = self.rtdetr.detect(frame)
+            if detections is not None:
+                return detections
+        return self.detect_fallback(frame)
 
 
 class CentroidTracker:
@@ -539,8 +570,42 @@ class CentroidTracker:
         return [self._tracks[track_id] for track_id in sorted(self._tracks)]
 
 
+def read_image_frame(path: Path) -> np.ndarray:
+    try:
+        encoded = np.fromfile(path, dtype=np.uint8)
+    except OSError as error:
+        raise RuntimeError(f"无法读取图片：{path}") from error
+    frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+    if frame is None:
+        raise RuntimeError(f"无法解码图片：{path}")
+    return frame
+
+
+def frame_to_qimage(frame: np.ndarray) -> QImage:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    height, width, channels = rgb.shape
+    return QImage(
+        rgb.data,
+        width,
+        height,
+        channels * width,
+        QImage.Format.Format_RGB888,
+    ).copy()
+
+
+def analyze_image(
+    path: Path,
+    detector: TwoWheelerDetector,
+) -> tuple[QImage, list[TrackedDetection]]:
+    frame = read_image_frame(path)
+    detections = detector.detect_fallback(frame)
+    tracks = CentroidTracker().update(detections)
+    return frame_to_qimage(frame), tracks
+
+
 class VideoAnalysisController(QObject):
     frame_ready = Signal(object, object, str)
+    image_ready = Signal(object, object, str, bool)
     event_raised = Signal(object)
     metrics_changed = Signal(dict)
     status_changed = Signal(str)
@@ -574,6 +639,8 @@ class VideoAnalysisController(QObject):
         self._parking_event_ids: set[int] = set()
         self._last_speed = 0.0
         self._detector_name = self.detector.name
+        self._image_frame: np.ndarray | None = None
+        self._image_started_at = 0.0
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
 
@@ -583,6 +650,7 @@ class VideoAnalysisController(QObject):
         if not capture.isOpened():
             raise RuntimeError(f"无法打开视频：{path}")
         self.capture = capture
+        self.detector.reset_results()
         self.detector.start()
         self.path = path
         self.source_name = path.name
@@ -591,23 +659,59 @@ class VideoAnalysisController(QObject):
         self._reset_analysis_state()
         self.running = True
         self._timer.start()
-        self.status_changed.emit(f"本地视频：{path.name} · {self.detector.name}")
+        self.status_changed.emit(f"本地视频：{path.name}")
         self.detector_status_changed.emit(self.detector.status_text)
+
+    def open_image(self, path: Path) -> None:
+        self.close()
+        frame = read_image_frame(path)
+        self.detector.reset_results()
+        self.detector.start()
+        self.path = path
+        self.source_name = path.name
+        self._reset_analysis_state()
+        self._image_frame = frame
+        self._image_started_at = time.monotonic()
+        fallback_detections = self.detector.detect_fallback(frame)
+        self.current_tracks = self.tracker.update(fallback_detections)
+        has_rtdetr = self.detector.rtdetr is not None and self.detector.rtdetr.available
+        self.running = has_rtdetr
+        self._evaluate_image_result(emit_events=not has_rtdetr)
+        if has_rtdetr:
+            self._timer.setInterval(100)
+            self._timer.start()
+        self.status_changed.emit(f"本地图片：{path.name}")
+        self.detector_status_changed.emit(self.detector.status_text)
+        self._emit_image_result()
 
     def close(self) -> None:
         self._timer.stop()
         if self.capture is not None:
             self.capture.release()
         self.capture = None
+        self._image_frame = None
         self.running = False
 
     def set_mode(self, mode: str) -> None:
+        if self.mode == mode:
+            return
         self.mode = mode
+        if self._image_frame is not None:
+            self._parking_event_ids.clear()
+            if mode == "parking":
+                self._evaluate_image_result(emit_events=True)
+            else:
+                for track in self.current_tracks:
+                    track.violation = None
+            self._emit_image_result()
+            return
         self._reset_analysis_state(keep_frame=True)
 
     def set_running(self, running: bool) -> None:
         self.running = running
-        if running and self.capture is not None:
+        if running and (self.capture is not None or self._image_frame is not None):
+            if self._image_frame is not None:
+                self._image_started_at = time.monotonic()
             self._timer.start()
         else:
             self._timer.stop()
@@ -618,6 +722,10 @@ class VideoAnalysisController(QObject):
         self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
         self._reset_analysis_state()
         self.set_running(True)
+
+    def restart_image(self) -> None:
+        if self.path is not None:
+            self.open_image(self.path)
 
     def set_speed_config(self, distance_m: float, threshold_kmh: float) -> None:
         self.speed_service.distance_m = distance_m
@@ -643,6 +751,9 @@ class VideoAnalysisController(QObject):
             self._evaluate_parking()
 
     def _tick(self) -> None:
+        if self._image_frame is not None:
+            self._tick_image()
+            return
         if not self.running or self.capture is None:
             return
         ok, frame = self.capture.read()
@@ -671,9 +782,7 @@ class VideoAnalysisController(QObject):
         else:
             self._evaluate_parking()
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        height, width, channels = rgb.shape
-        image = QImage(rgb.data, width, height, channels * width, QImage.Format.Format_RGB888).copy()
+        image = frame_to_qimage(frame)
         self.current_frame = image
         self.frame_ready.emit(image, list(self.current_tracks), self.source_name)
         self.metrics_changed.emit(
@@ -681,6 +790,67 @@ class VideoAnalysisController(QObject):
                 "active_tracks": len(self.current_tracks),
                 "current_speed": self._last_speed,
                 "parking_violations": sum(1 for item in self.current_tracks if item.violation),
+            }
+        )
+
+    def _tick_image(self) -> None:
+        frame = self._image_frame
+        rtdetr = self.detector.rtdetr
+        if frame is None or rtdetr is None:
+            self._finish_image_analysis()
+            return
+        detector_status = self.detector.status_text
+        if detector_status != self._detector_name:
+            self._detector_name = detector_status
+            self.detector_status_changed.emit(detector_status)
+        if rtdetr._failed or (rtdetr.process is not None and rtdetr.process.poll() is not None):
+            self._finish_image_analysis()
+            return
+        if time.monotonic() - self._image_started_at > 30:
+            self._finish_image_analysis()
+            return
+        detections = rtdetr.detect(frame)
+        if detections is None:
+            return
+        self.tracker.reset()
+        self.current_tracks = self.tracker.update(detections)
+        self._parking_event_ids.clear()
+        self._evaluate_image_result(emit_events=True)
+        self._finish_image_analysis()
+
+    def _evaluate_image_result(self, *, emit_events: bool) -> None:
+        if self.mode != "parking":
+            return
+        if emit_events:
+            self._evaluate_parking()
+            return
+        for track in self.current_tracks:
+            track.violation = self.parking_service.classify(track.rect)
+
+    def _finish_image_analysis(self) -> None:
+        self._timer.stop()
+        self.running = False
+        self.detector_status_changed.emit(self.detector.status_text)
+        self._emit_image_result()
+
+    def _emit_image_result(self) -> None:
+        if self._image_frame is None:
+            return
+        image = frame_to_qimage(self._image_frame)
+        self.current_frame = image
+        self.image_ready.emit(
+            image,
+            list(self.current_tracks),
+            self.source_name,
+            self.running,
+        )
+        self.metrics_changed.emit(
+            {
+                "active_tracks": len(self.current_tracks),
+                "current_speed": 0.0,
+                "parking_violations": sum(
+                    1 for item in self.current_tracks if item.violation
+                ),
             }
         )
 
@@ -743,7 +913,11 @@ class VideoAnalysisController(QObject):
             self.event_raised.emit(
                 MonitorEvent(
                     event_type=violation,
-                    source="本地视频 · 停车观察位",
+                    source=(
+                        "本地图片 · 停车观察位"
+                        if self._image_frame is not None
+                        else "本地视频 · 停车观察位"
+                    ),
                     detail=f"{track.label}目标 #{track.track_id} 超出配置停车区域",
                     severity="warning",
                     value=f"置信度 {track.confidence:.2f}",

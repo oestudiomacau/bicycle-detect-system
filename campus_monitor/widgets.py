@@ -372,7 +372,7 @@ class VideoCanvas(QWidget):
         hint = QRectF(content.left() + 14, content.bottom() - 48, min(430, content.width() - 28), 32)
         painter.drawRoundedRect(hint, 4, 4)
         painter.setPen(QColor("#f7d58b"))
-        painter.setFont(QFont("Noto Sans SC", 9))
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
         painter.drawText(hint.adjusted(10, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter, hint_text)
         painter.restore()
 
@@ -572,7 +572,7 @@ class VideoCanvas(QWidget):
         painter.setBrush(QColor(8, 13, 16, 190))
         painter.drawRoundedRect(QRectF(14, 13, 310, 34), 4, 4)
         painter.setPen(QColor("#e7ecee"))
-        painter.setFont(QFont("Noto Sans SC", 9))
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
         mode = "道路观察位 · 双线测速" if self.engine.mode == "road" else "停车观察位 · 违规停放"
         state = "分析中" if self.engine.running else "已暂停"
         source = self.source_name if self.video_frame is not None else "模拟视频源"
@@ -583,7 +583,7 @@ class VideoCanvas(QWidget):
         painter.setBrush(QColor(8, 13, 16, 165))
         painter.drawRoundedRect(QRectF(self.width() - 180, self.height() - 39, 166, 26), 4, 4)
         painter.setPen(QColor("#cfd7da"))
-        painter.setFont(QFont("Noto Sans SC", 8))
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
         painter.drawText(
             QRectF(self.width() - 170, self.height() - 39, 148, 26),
             Qt.AlignmentFlag.AlignCenter,
@@ -596,5 +596,5 @@ class VideoCanvas(QWidget):
         painter.setBrush(QColor(12, 18, 21, 215))
         painter.drawRoundedRect(rect, 3, 3)
         painter.setPen(color)
-        painter.setFont(QFont("Noto Sans SC", 8))
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
         painter.drawText(rect.adjusted(7, 0, -5, 0), Qt.AlignmentFlag.AlignVCenter, text)
